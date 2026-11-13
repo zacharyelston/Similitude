@@ -17,7 +17,11 @@ What a design file may hold, beyond plain TOML:
 - **A range.** `speed = {ref = 9.0, range = [7.0, 12.0]}` loads as an `Uncertain` with `.ref`, `.lo` and `.hi`.
   - Add `unit = "kn"`, or write the three numbers as `"9 kn"` strings, to give it a unit.
   - Code that wants one number reads `.ref`, calls `float()`, or takes `nominal(design)`, which swaps every
-    range for its reference value.
+    range for its reference value. Each of these is a choice to evaluate the nominal design, and a result
+    made that way should say so.
+  - A range is how far an uncertain input may lie from `ref`, and nothing more. It is not the bounds a search
+    may move a design variable between. It names no probability distribution, and says nothing about how
+    inputs vary together, so nothing here treats it as one.
 - **`include`.** `include = "base.toml"`, or a list of files, merges other design files in first. Paths are
   relative to the file that names them. Tables merge key by key; later includes win over earlier ones, and the
   including file wins over all of them.
@@ -108,7 +112,10 @@ class Design(SimpleNamespace):
 class Uncertain:
     """A value known only as a range: `ref` is the working value, and `lo <= ref <= hi`.
 
-    The three are plain numbers, or pint quantities in one unit."""
+    The three are plain numbers, or pint quantities in one unit.
+
+    The range is the input's uncertainty. It is not a search bound for an optimizer, and it carries no
+    probability distribution and no dependence on other inputs. Reading `ref` evaluates the nominal case."""
 
     ref: Any
     lo: Any
