@@ -20,6 +20,7 @@ from enum import StrEnum
 
 _OPS = ("<=", ">=")
 _NON_FINITE = {"NaN": math.nan, "Infinity": math.inf, "-Infinity": -math.inf}
+_NON_FINITE_KEY = "nonfinite"  # JSON has no NaN or infinity: they are written as {"nonfinite": "NaN"}
 
 
 class Status(StrEnum):
@@ -80,8 +81,8 @@ class Check:
             raise ValueError(f"{self.name}: op must be one of {_OPS}, not {self.op!r}")
         if "\n" in self.reason or "\r" in self.reason:
             raise ValueError(f"{self.name}: the reason must be one line")
-        if self.warn_within < 0:
-            raise ValueError(f"{self.name}: warn_within is a fraction of the limit and can't be negative")
+        if not (math.isfinite(self.warn_within) and self.warn_within >= 0):
+            raise ValueError(f"{self.name}: warn_within is a fraction of the limit: finite, and not negative")
         if self.limit is None:
             if self.warn_limit is not None:
                 raise ValueError(f"{self.name}: warn_limit needs a limit")
@@ -140,16 +141,15 @@ class Check:
     @classmethod
     def from_dict(cls, d: dict) -> Check:
         """The check `to_dict` wrote. Raises ValueError if the stored status isn't what the numbers give."""
-        limit = _from_json_number(d.get("limit"))
         value = d["value"]
-        if limit is not None or value in _NON_FINITE:  # otherwise an INFO check, whose value may be text
+        if not isinstance(value, str):  # a string is an INFO check's text, whatever it spells
             value = _from_json_number(value)
         check = cls(
             group=d["group"],
             name=d["name"],
             value=value,
             unit=d.get("unit", ""),
-            limit=limit,
+            limit=_from_json_number(d.get("limit")),
             op=d.get("op", "<="),
             warn_within=d.get("warn_within", 0.0),
             reason=d.get("reason", ""),
@@ -206,7 +206,8 @@ def to_markdown(checks: Iterable[Check]) -> str:
 def to_json(checks: Iterable[Check]) -> str:
     """The set as JSON: the overall result, the exit code, the counts and every check.
 
-    JSON has no NaN or infinity, so those are written as the strings "NaN", "Infinity" and "-Infinity".
+    JSON has no NaN or infinity, so a number that is one is written as an object, such as
+    `{"nonfinite": "NaN"}`, `{"nonfinite": "Infinity"}` or `{"nonfinite": "-Infinity"}`. A string is always text.
     """
     checks = list(checks)
     doc = {
@@ -250,15 +251,17 @@ def _cell(text: str) -> str:
     return " ".join(text.split()).replace("|", "\\|")
 
 
-def _to_json_number(x: float | str | None) -> float | str | None:
+def _to_json_number(x: float | str | None) -> float | str | dict | None:
     if isinstance(x, float) and not math.isfinite(x):
-        return "NaN" if math.isnan(x) else "Infinity" if x > 0 else "-Infinity"
+        return {_NON_FINITE_KEY: "NaN" if math.isnan(x) else "Infinity" if x > 0 else "-Infinity"}
     return x
 
 
-def _from_json_number(x: float | str | None) -> float | None:
-    if isinstance(x, str):
-        if x not in _NON_FINITE:
+def _from_json_number(x: float | dict | None) -> float | None:
+    if isinstance(x, dict):
+        if set(x) != {_NON_FINITE_KEY} or x[_NON_FINITE_KEY] not in _NON_FINITE:
             raise ValueError(f"expected a number, got {x!r}")
-        return _NON_FINITE[x]
+        return _NON_FINITE[x[_NON_FINITE_KEY]]
+    if isinstance(x, bool) or not isinstance(x, (int, float, type(None))):
+        raise ValueError(f"expected a number, got {x!r}")
     return x

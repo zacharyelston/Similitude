@@ -126,6 +126,9 @@ def test_warn_within_is_a_fraction_of_the_limits_size():
         {"op": "<"},
         {"reason": "two\nlines"},
         {"warn_within": -0.1},
+        {"warn_within": math.nan},  # would hide the warning, and can't be written as JSON
+        {"warn_within": math.inf},
+        {"warn_within": -math.inf},
         {"limit": None, "warn_limit": 5.0},
         {"warn_limit": 12.0},  # looser than the limit of 10: the band could never be reached
         {"value": "12:1"},  # text can't be held against a limit
@@ -221,10 +224,40 @@ def test_json_is_strict_even_for_values_json_cant_hold():
     ]
     text = checks.to_json(original)
     json.loads(text, parse_constant=lambda name: pytest.fail(f"bare {name} in the JSON"))
+    doc = json.loads(text)["checks"]
+    assert doc[0]["value"] == {"nonfinite": "NaN"}
+    assert doc[1]["value"] == {"nonfinite": "-Infinity"}
+    assert doc[2]["limit"] == {"nonfinite": "Infinity"}
     back = checks.from_json(text)
     assert math.isnan(back[0].value) and back[0].status is Status.FAIL
     assert back[1].value == -math.inf
     assert back[2].limit == math.inf and back[2].status is Status.PASS
+
+
+@pytest.mark.parametrize("text", ["NaN", "Infinity", "-Infinity", "nan", "inf"])
+def test_text_that_spells_a_non_finite_number_stays_text(text):
+    original = [Check("g", "text", text, ""), Check("g", "number", float(text), "")]
+    back = checks.from_json(checks.to_json(original))
+    assert back[0] == original[0] and back[0].value == text
+    assert isinstance(back[1].value, float) and str(back[1].value) == str(original[1].value)
+
+
+@pytest.mark.parametrize(
+    ("field", "stored"),
+    [
+        ("limit", "90"),
+        ("limit", "NaN"),
+        ("limit", {"nonfinite": "huge"}),
+        ("limit", {"nonfinite": "NaN", "extra": 1}),
+        ("warn_limit", True),
+        ("value", [68.0]),
+    ],
+)
+def test_json_whose_numbers_arent_numbers_is_refused(field, stored):
+    doc = json.loads(checks.to_json([a_warn()]))
+    doc["checks"][0][field] = stored
+    with pytest.raises(ValueError, match="expected a number"):
+        checks.from_json(json.dumps(doc))
 
 
 def test_json_whose_status_disagrees_with_its_numbers_is_refused():
