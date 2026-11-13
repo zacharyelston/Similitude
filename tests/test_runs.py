@@ -544,6 +544,8 @@ def test_the_report_shows_each_expected_check_beside_its_result(repo):
     assert report == (
         f"# Kept run {RUN}\n"
         "\n"
+        "Archived by `similitude.runs.keep`. Keeping a run is not a sign-off of its result.\n"
+        "\n"
         f"- **Recorded:** when the run started ({source['started']}), by `similitude.runs.start`.\n"
         f"- **Commit:** `{git(repo, 'rev-parse', 'HEAD')}` on `main`\n"
         "- **Working tree:** clean\n"
@@ -741,6 +743,7 @@ def test_the_readme_gets_one_row_per_kept_run(repo):
     keep(begin(repo, "longer-hull"), repo, name="longer-hull")
     readme = (repo / "runs" / "README.md").read_text(encoding="utf-8")
     assert readme.startswith("# Kept runs\n")
+    assert "Keeping a run archives it. It is not a sign-off" in readme
     assert readme.splitlines()[-4:] == [
         "| Run | Commit | Branch | Expected checks | What it shows |",
         "|---|---|---|---|---|",

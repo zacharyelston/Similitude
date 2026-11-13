@@ -19,6 +19,10 @@
 
 A kept run is never edited or overwritten; make a new one.
 
+Keeping archives a run. It is not a sign-off: a kept run may have failed its checks, and nothing here records
+that anyone accepted its result. Nor is a kept run a full recipe for repeating it: solver and dependency versions,
+seeds and the content of uncommitted files are not recorded.
+
 A run declares its pass/fail checks before it starts, in `expect.toml` in its output directory:
 
     [[check]]
@@ -76,6 +80,9 @@ _README_HEAD = """\
 Each directory is a copy of an output directory worth keeping, named `<date>_<name>`. Its `SOURCE` file records
 the commit, branch and command, and whether they were recorded when the run started or only when it was kept.
 `KEPT.md` shows the run's expected checks beside their results. Never edit a kept run; make a new one.
+
+Keeping a run archives it. It is not a sign-off: a kept run may have failed its checks, and nothing here records
+that anyone accepted its result.
 
 | Run | Commit | Branch | Expected checks | What it shows |
 |---|---|---|---|---|
@@ -538,6 +545,8 @@ def _report(source: dict, outcomes: list[Outcome]) -> str:
         tree = "clean"
     lines = [
         f"# Kept run {source['run']}",
+        "",
+        "Archived by `similitude.runs.keep`. Keeping a run is not a sign-off of its result.",
         "",
         f"- **Recorded:** {recorded}.",
         f"- **Commit:** `{source['commit']}` on `{source['branch']}`",
