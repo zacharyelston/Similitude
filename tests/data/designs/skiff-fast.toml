@@ -1,0 +1,8 @@
+# Two includes: the later one wins over the earlier, and this file wins over both.
+
+include = ["skiff.toml", "outboard-big.toml"]
+
+name = "skiff-fast"
+
+[hull]
+speed = { ref = 14.0, range = [11.0, 18.0] }

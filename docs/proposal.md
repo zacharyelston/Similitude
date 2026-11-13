@@ -197,6 +197,7 @@ These are the licenses as I remember them. Confirm each one before adopting the 
 | OpenTURNS, chaospy | Uncertainty propagation | LGPL, MIT |
 | PhysicsNeMo, neuraloperator | Neural surrogates for whole fields | Apache-2.0, MIT |
 | Blender | Viewing and rendering | GPL |
+| pint | Units on design values | BSD-3-Clause (adopted; read from the package's metadata at 0.26.2) |
 
 ## Structure and licensing
 
