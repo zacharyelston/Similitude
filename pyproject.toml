@@ -1,7 +1,7 @@
 [project]
-name = "froude"
+name = "similitude"
 version = "0.1.0"
-description = "An open-source, AI-assisted toolkit for sizing, simulating and optimizing physical designs across air, water and structure"
+description = "An open-source, AI-assisted platform for sizing, simulating and optimizing machines that work in air, water, ground and fields"
 readme = "README.md"
 authors = [
     { name = "Zac Elston", email = "zacelston@aol.com" }
