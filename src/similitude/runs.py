@@ -1,15 +1,25 @@
 """Kept runs: an output directory copied to `runs/<date>_<name>/` with where it came from.
 
-`out/` is scratch. A run worth keeping is copied with `keep`, which adds:
+`out/` is scratch. A run has two moments:
 
-- `SOURCE`: the commit, the branch and the command line (TOML; read it with `read_source`);
-- `design.toml`: the resolved design the run used;
-- `KEPT.md`: a report of the source and of each check declared before the run beside its result;
-- a row in `runs/README.md`.
+1. **Before it produces anything, `start(out_dir)`** writes `START` into the output directory: the commit, the
+   branch, whether the working tree was dirty, the command line, and the SHA-256 of `expect.toml`.
+2. **When it is worth keeping, `keep(out_dir, name)`** copies the output directory and adds:
+   - `SOURCE`: the commit, the branch and the command line (TOML; read it with `read_source`);
+   - `design.toml`: the resolved design the run used;
+   - `KEPT.md`: a report of the source and of each expected check beside its result;
+   - a row in `runs/README.md`.
+
+`keep` only knows what the run looked like when it started if `start` recorded it. So `SOURCE` says which it is:
+
+- `recorded = "at run start"`: the commit, branch, dirty state and command are those `start` wrote down, and
+  `expect.toml` is known to be unchanged since then.
+- `recorded = "when kept"`: the run made no `START`. The commit is the checkout's when `keep` ran, which may not be
+  the source that made the results, and nothing shows when `expect.toml` was written. The report says so.
 
 A kept run is never edited or overwritten; make a new one.
 
-A run declares its pass/fail checks before it runs, in `expect.toml` in its output directory:
+A run declares its pass/fail checks before it starts, in `expect.toml` in its output directory:
 
     [[check]]
     group = "Float"          # optional
@@ -28,6 +38,7 @@ Git is called as a separate program.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -40,6 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 RUNS_DIR = "runs"
+START = "START"
 SOURCE = "SOURCE"
 DESIGN = "design.toml"
 EXPECT = "expect.toml"
@@ -47,15 +59,23 @@ RESULTS = "checks.json"
 REPORT = "KEPT.md"
 README = "README.md"
 
+AT_START = "at run start"
+WHEN_KEPT = "when kept"
+DECLARED_BEFORE = "declared before the run"
+FOUND_WHEN_KEPT = "found when kept"
+NONE_DECLARED = "none"
+
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_COMMIT = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
+_NON_FINITE = {"NaN": float("nan"), "Infinity": float("inf"), "-Infinity": float("-inf")}
 _OPS = ("<=", ">=")
 _EXPECT_KEYS = {"group", "name", "op", "limit", "unit", "reason"}
 _README_HEAD = """\
 # Kept runs
 
 Each directory is a copy of an output directory worth keeping, named `<date>_<name>`. Its `SOURCE` file records
-the commit, branch and command it came from, and `KEPT.md` shows the checks declared before the run beside
-their results. Never edit a kept run; make a new one.
+the commit, branch and command, and whether they were recorded when the run started or only when it was kept.
+`KEPT.md` shows the run's expected checks beside their results. Never edit a kept run; make a new one.
 
 | Run | Commit | Branch | Expected checks | What it shows |
 |---|---|---|---|---|
@@ -68,6 +88,10 @@ class DirtyTreeError(RuntimeError):
 
 class UndisposedWarningError(RuntimeError):
     """The run has a WARN with no disposition recorded."""
+
+
+class ExpectationsChangedError(RuntimeError):
+    """`expect.toml` is not the file the run started with."""
 
 
 @dataclass(frozen=True)
@@ -97,6 +121,42 @@ class Outcome:
     note: str = ""
 
 
+def start(
+    out_dir: str | os.PathLike,
+    *,
+    repo: str | os.PathLike | None = None,
+    command: str | None = None,
+) -> Path:
+    """Record where a run starts from, in `START` in its output directory, and return that file.
+
+    Call it before the run produces anything, and after writing `expect.toml` if the run declares checks. It
+    records the commit, the branch, the working tree's uncommitted changes, the command line (by default this
+    process's own) and the SHA-256 of `expect.toml`. `keep` uses the record in place of what it would otherwise
+    read from the checkout at keep time.
+
+    The output directory is created if need be. One that already has a `START` or results is refused: a run
+    starts once, in a fresh directory. A dirty tree is recorded, not refused; `keep` decides.
+    """
+    out = Path(out_dir).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    for existing in (SOURCE, START, RESULTS):
+        if (out / existing).exists():
+            raise FileExistsError(f"{out_dir} already has a {existing}; start a run in a fresh output directory")
+    root = _root(repo)
+    _declared(out)  # a malformed expect.toml stops the run here, not after it
+    record = {"started": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")}
+    record |= _checkout_state(root)
+    record["command"] = _scrub(command if command is not None else shlex.join(sys.argv), root)
+    if (out / EXPECT).exists():
+        record["expect_sha256"] = _sha256(out / EXPECT)
+    path = out / START
+    path.write_text(
+        _toml_text("Where this run started from. Written by similitude.runs.start; never edit it.", record),
+        encoding="utf-8",
+    )
+    return path
+
+
 def keep(
     src_dir: str | os.PathLike,
     name: str,
@@ -114,23 +174,33 @@ def keep(
       directory.
     - `design`: the resolved design file, copied in as `design.toml`. Leave it out when the run already wrote
       `design.toml` into `src_dir`. A run with no design is refused.
-    - `command`: the command line that made the run; by default this process's own. The repository's path is
-      written as `.` and the home directory as `~`.
+    - `command`: for a run with no `START`, the command line that made it; by default this process's own. A run
+      with a `START` recorded its own, and passing one is an error. The repository's path is written as `.` and
+      the home directory as `~`.
     - `shows`: one line for the `runs/README.md` row, saying what the run shows.
-    - `allow_dirty`: keep the run although the working tree has uncommitted changes, and record that it did.
-      Untracked files count, so keep output directories ignored, as `out/` is. Changes under `runs/` never count.
+    - `allow_dirty`: keep the run although the working tree had uncommitted changes, and record that it did. The
+      changed files are not kept, so such a run can't be reproduced from its commit. Untracked files count, so
+      keep output directories ignored, as `out/` is. Changes under `runs/` never count.
     - `date`: the date in the directory's name; by default today.
 
-    Raises FileExistsError rather than overwrite a kept run, DirtyTreeError for a dirty tree, and
-    UndisposedWarningError if `checks.json` holds a WARN with no disposition. Nothing is written unless the whole
-    keep succeeds.
+    The commit, branch, dirty state and command come from the run's `START` if it has one, and otherwise from the
+    checkout as it is now; `SOURCE` and the report say which.
+
+    Raises:
+
+    - FileExistsError rather than overwrite a kept run;
+    - DirtyTreeError for a dirty tree;
+    - UndisposedWarningError if `checks.json` holds a WARN with no disposition;
+    - ExpectationsChangedError if `expect.toml` was added, edited or removed after the run started.
+
+    A keep that fails leaves `runs/` as it was: no directory and no README row.
     """
     src = Path(src_dir).resolve()
     if not src.is_dir():
         raise NotADirectoryError(f"{src_dir} is not an output directory")
     if not _NAME.fullmatch(name):
         raise ValueError(f"a run's name is letters, digits, '.', '_' and '-', not {name!r}")
-    root = Path(_git(Path(repo) if repo is not None else Path.cwd(), "rev-parse", "--show-toplevel")).resolve()
+    root = _root(repo)
     run = f"{(date or datetime.date.today()).isoformat()}_{name}"
     dest = root / RUNS_DIR / run
     if dest.exists():
@@ -148,44 +218,69 @@ def keep(
         raise UndisposedWarningError(f"record a disposition in {RESULTS} for each WARN before keeping: {names}")
     outcomes = [_judge(e, results) for e in declared]
 
-    commit = _git(root, "rev-parse", "HEAD")
-    branch = _git(root, "symbolic-ref", "--short", "-q", "HEAD", check=False) or "(detached)"
-    dirty_files = _git(root, "status", "--porcelain", "--untracked-files=all", "--", ".", f":(exclude){RUNS_DIR}")
-    dirty_files = [line.strip() for line in dirty_files.splitlines()]
+    started = _read_start(src)
+    if started is None:
+        state = _checkout_state(root)
+        state["command"] = _scrub(command if command is not None else shlex.join(sys.argv), root)
+        when = "has"
+    else:
+        if command is not None:
+            raise ValueError(f"the run recorded its own command in {START}; don't pass command=")
+        if not _git(root, "rev-parse", "--verify", "-q", started["commit"] + "^{commit}", check=False):
+            raise ValueError(f"the run started at commit {started['commit'][:7]}, which is not in this repository")
+        _check_expectations_unchanged(src, started)
+        state = {key: started[key] for key in ("commit", "branch", "dirty", "dirty_files", "command")}
+        when = "had"
+    dirty_files = state.pop("dirty_files")
     if dirty_files and not allow_dirty:
         raise DirtyTreeError(
-            f"the working tree has uncommitted changes ({len(dirty_files)} paths, first: {dirty_files[0]}); "
-            "commit them, or pass allow_dirty=True to keep the run and record that it was dirty"
+            f"the working tree {when} uncommitted changes ({len(dirty_files)} paths, first: {dirty_files[0]}); "
+            "commit them and run again, or pass allow_dirty=True to keep the run and record that it was dirty"
         )
-    source = {
-        "run": run,
-        "commit": commit,
-        "branch": branch,
-        "dirty": bool(dirty_files),
-        "command": _scrub(command if command is not None else shlex.join(sys.argv), root),
-    }
+    source = {"run": run} | state
+    source["recorded"] = WHEN_KEPT if started is None else AT_START
+    if started is not None:
+        source["started"] = started["started"]
+    if not declared:
+        source["expectations"] = NONE_DECLARED
+    else:
+        source["expectations"] = FOUND_WHEN_KEPT if started is None else DECLARED_BEFORE
     if dirty_files:
         source["dirty_files"] = dirty_files
 
+    readme = root / RUNS_DIR / README
     tmp = dest.with_name(f".{run}.tmp")
+    readme_tmp = dest.with_name(f".{run}.{README}.tmp")
     if tmp.exists():
         shutil.rmtree(tmp)
     try:
         shutil.copytree(src, tmp)
         if design_path != src / DESIGN:
             shutil.copyfile(design_path, tmp / DESIGN)
-        (tmp / SOURCE).write_text(_source_text(source), encoding="utf-8")
+        header = "Where this kept run came from. Written by similitude.runs.keep; never edit a kept run."
+        (tmp / SOURCE).write_text(_toml_text(header, source), encoding="utf-8")
         (tmp / REPORT).write_text(_report(source, outcomes), encoding="utf-8")
+        readme_tmp.write_text(_readme_with_row(readme, source, outcomes, shows), encoding="utf-8")
         os.rename(tmp, dest)
+        try:
+            os.replace(readme_tmp, readme)
+        except BaseException:
+            os.rename(dest, tmp)  # the run is not kept until its README row is
+            raise
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
+        readme_tmp.unlink(missing_ok=True)
         raise
-    _add_readme_row(root / RUNS_DIR / README, source, outcomes, shows)
     return dest
 
 
 def read_source(run_dir: str | os.PathLike) -> dict:
-    """A kept run's `SOURCE`: `run`, `commit`, `branch`, `dirty`, `command`, and `dirty_files` if it was dirty."""
+    """A kept run's `SOURCE`.
+
+    `run`, `commit`, `branch`, `dirty`, `command`; `recorded`, which is "at run start" or "when kept";
+    `expectations`, which is "declared before the run", "found when kept" or "none"; `started` if the run made a
+    start record; and `dirty_files` if it was dirty.
+    """
     return tomllib.loads((Path(run_dir) / SOURCE).read_text(encoding="utf-8"))
 
 
@@ -213,6 +308,66 @@ def _git(cwd: Path, *args: str, check: bool = True) -> str:
     if check and done.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed in {cwd}: {done.stderr.strip()}")
     return done.stdout.rstrip("\n")
+
+
+def _root(repo: str | os.PathLike | None) -> Path:
+    return Path(_git(Path(repo) if repo is not None else Path.cwd(), "rev-parse", "--show-toplevel")).resolve()
+
+
+def _checkout_state(root: Path) -> dict:
+    """The checkout as it is now: its commit, branch and uncommitted changes outside `runs/`."""
+    status = _git(root, "status", "--porcelain", "--untracked-files=all", "--", ".", f":(exclude){RUNS_DIR}")
+    dirty_files = [line.strip() for line in status.splitlines()]
+    return {
+        "commit": _git(root, "rev-parse", "HEAD"),
+        "branch": _git(root, "symbolic-ref", "--short", "-q", "HEAD", check=False) or "(detached)",
+        "dirty": bool(dirty_files),
+        "dirty_files": dirty_files,
+    }
+
+
+# --- the start record
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _read_start(run_dir: Path) -> dict | None:
+    """The run's `START`, or None if it made none."""
+    path = run_dir / START
+    if not path.exists():
+        return None
+    try:
+        record = tomllib.loads(path.read_text(encoding="utf-8"))
+        ok = (
+            isinstance(record["commit"], str)
+            and _COMMIT.fullmatch(record["commit"])
+            and isinstance(record["dirty"], bool)
+            and all(isinstance(record[key], str) for key in ("started", "branch", "command"))
+            and isinstance(record.get("expect_sha256", ""), str)
+            and all(isinstance(f, str) for f in record.setdefault("dirty_files", []))
+            and record["dirty"] == bool(record["dirty_files"])
+        )
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError, KeyError, TypeError):
+        ok = False
+    if not ok:
+        raise ValueError(f"{START} is not a record that similitude.runs.start wrote")
+    return record
+
+
+def _check_expectations_unchanged(run_dir: Path, started: dict) -> None:
+    recorded = started.get("expect_sha256")
+    now = _sha256(run_dir / EXPECT) if (run_dir / EXPECT).exists() else None
+    if now == recorded:
+        return
+    if recorded is None:
+        what = "was added after the run started; the run declared no checks, so remove it"
+    elif now is None:
+        what = "was there when the run started, and is gone; put it back"
+    else:
+        what = "was edited after the run started; restore the file the run started with"
+    raise ExpectationsChangedError(f"{EXPECT} {what}")
 
 
 # --- the design
@@ -298,12 +453,13 @@ def _judge(expected: Expectation, results: list[dict]) -> Outcome:
         groups = ", ".join(str(r.get("group", "")) for r in matches)
         raise ValueError(f"{EXPECT}: {expected.name!r} matches results in several groups ({groups}); give its group")
     result = matches[0]
-    unit = str(result.get("unit", ""))
+    unit = str(result.get("unit") or "")
     value = _number(result.get("value"))
     if value is None:
         return Outcome(expected, "FAIL", result.get("value"), unit, "the result is not a number")
-    if expected.unit and unit and expected.unit != unit:
-        return Outcome(expected, "FAIL", value, unit, f"declared in {expected.unit} but reported in {unit}")
+    if expected.unit and expected.unit != unit:
+        reported = f"reported in {unit}" if unit else "the result has no unit"
+        return Outcome(expected, "FAIL", value, unit, f"declared in {expected.unit} but {reported}")
     holds = value <= expected.limit if expected.op == "<=" else value >= expected.limit
     note = ""
     own_limit = _number(result.get("limit"))
@@ -313,12 +469,12 @@ def _judge(expected: Expectation, results: list[dict]) -> Outcome:
 
 
 def _number(x) -> float | None:
-    """A number from `checks.json`, where NaN and the infinities are written as strings."""
-    if isinstance(x, bool) or x is None:
+    """A number from `checks.json`, where a NaN or an infinity is written as `{"nonfinite": "NaN"}`."""
+    if isinstance(x, dict) and set(x) == {"nonfinite"} and x["nonfinite"] in _NON_FINITE:
+        return _NON_FINITE[x["nonfinite"]]
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
         return None
-    if isinstance(x, (int, float)):
-        return float(x)
-    return {"NaN": float("nan"), "Infinity": float("inf"), "-Infinity": float("-inf")}.get(x)
+    return float(x)
 
 
 def _label(result: dict) -> str:
@@ -327,8 +483,6 @@ def _label(result: dict) -> str:
 
 
 def _tally(outcomes: list[Outcome]) -> str:
-    if not outcomes:
-        return "none declared"
     return f"{sum(o.verdict == 'PASS' for o in outcomes)} of {len(outcomes)} PASS"
 
 
@@ -347,13 +501,13 @@ def _toml_string(text: str) -> str:
     return json.dumps(text, ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
-def _source_text(source: dict) -> str:
-    lines = ["# Where this kept run came from. Written by similitude.runs.keep; never edit a kept run."]
-    for key, value in source.items():
+def _toml_text(header: str, mapping: dict) -> str:
+    lines = [f"# {header}"]
+    for key, value in mapping.items():
         if isinstance(value, bool):
             text = "true" if value else "false"
         elif isinstance(value, list):
-            text = "[" + "".join(f"\n    {_toml_string(v)}," for v in value) + "\n]"
+            text = "[" + "".join(f"\n    {_toml_string(v)}," for v in value) + ("\n]" if value else "]")
         else:
             text = _toml_string(value)
         lines.append(f"{key} = {text}")
@@ -369,13 +523,23 @@ def _code(text: str) -> str:
 
 
 def _report(source: dict, outcomes: list[Outcome]) -> str:
+    at_start = source["recorded"] == AT_START
+    if at_start:
+        recorded = f"when the run started ({source['started']}), by `similitude.runs.start`"
+    else:
+        recorded = (
+            "when the run was kept, not when it ran. The run made no start record, so the commit, working tree "
+            "and command below are those of the keep, and may not be what produced these results"
+        )
     if source["dirty"]:
-        tree = "dirty when kept: " + ", ".join(_code(f) for f in source.get("dirty_files", []))
+        files = ", ".join(_code(f) for f in source.get("dirty_files", []))
+        tree = f"dirty: {files}. The changed files are not kept, so the commit alone does not reproduce this run"
     else:
         tree = "clean"
     lines = [
         f"# Kept run {source['run']}",
         "",
+        f"- **Recorded:** {recorded}.",
         f"- **Commit:** `{source['commit']}` on `{source['branch']}`",
         f"- **Working tree:** {tree}",
         f"- **Command:** {_code(source['command'])}",
@@ -385,11 +549,23 @@ def _report(source: dict, outcomes: list[Outcome]) -> str:
         "",
     ]
     if not outcomes:
-        lines.append("No checks were declared before this run.")
+        if at_start:
+            lines.append(f"The run started with no {EXPECT}: no checks were declared before it.")
+        else:
+            lines.append(f"The run has no {EXPECT}: no checks were declared for it.")
         return "\n".join(lines) + "\n"
+    if source["expectations"] == DECLARED_BEFORE:
+        timing = (
+            f"Declared in [{EXPECT}]({EXPECT}) before the run: the file matches the SHA-256 recorded when the "
+            "run started."
+        )
+    else:
+        timing = (
+            f"From [{EXPECT}]({EXPECT}) as it was when the run was kept. The run made no start record, so nothing "
+            "shows these were written before the run."
+        )
     lines += [
-        f"Declared in [{EXPECT}]({EXPECT}) before the run, and judged against the limits written there. "
-        f"Results are from [{RESULTS}]({RESULTS}).",
+        f"{timing} Each check is judged against the limit written there. Results are from [{RESULTS}]({RESULTS}).",
         "",
         "| Verdict | Check | Declared | Result | Note |",
         "|---|---|---|---|---|",
@@ -409,10 +585,19 @@ def _report(source: dict, outcomes: list[Outcome]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _add_readme_row(readme: Path, source: dict, outcomes: list[Outcome], shows: str) -> None:
+def _readme_with_row(readme: Path, source: dict, outcomes: list[Outcome], shows: str) -> str:
+    """The README's text with this run's row added."""
     text = readme.read_text(encoding="utf-8") if readme.exists() else _README_HEAD
     if not text.endswith("\n"):
         text += "\n"
-    commit = f"`{source['commit'][:7]}`" + (" (dirty)" if source["dirty"] else "")
-    cells = (f"[{source['run']}]({source['run']}/)", commit, source["branch"], _tally(outcomes), shows)
-    readme.write_text(text + "| " + " | ".join(_cell(c) for c in cells) + " |\n", encoding="utf-8")
+    commit = f"`{source['commit'][:7]}`"
+    if source["dirty"]:
+        commit += " (dirty)"
+    if source["recorded"] == WHEN_KEPT:
+        commit += " (when kept)"
+    if not outcomes:
+        expected = "none declared"
+    else:
+        expected = _tally(outcomes) + ("" if source["expectations"] == DECLARED_BEFORE else " (timing unverified)")
+    cells = (f"[{source['run']}]({source['run']}/)", commit, source["branch"], expected, shows)
+    return text + "| " + " | ".join(_cell(c) for c in cells) + " |\n"
