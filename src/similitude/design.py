@@ -31,7 +31,17 @@ Overrides, from the file's `[overrides]` or from `load(..., overrides=...)`, fol
 - The key must already exist. An unknown key is an error, never a silent addition.
 - A value with a unit can only be overridden by a value with a compatible unit, which is converted to the
   design's unit. A bare number is a mismatch, and so is a unit on a value that has none.
+- A range stays a range. Override its `.ref`, which must stay inside the bounds, or give a whole new
+  `{ref, range}`. A single number in its place is an error, because it would drop the bounds. To pin a value on
+  purpose, give a range of zero width: `{ref = 10.0, range = [10.0, 10.0]}`.
+- A list is overridden by a list of the same length, and each item must fit the item it replaces by these same
+  rules. An override cannot add or drop items, or turn a single value into a list.
+- A table is never replaced whole: a nested table of overrides is read as more dotted keys.
 - The `overrides` argument is applied last, so it wins over every file.
+
+Only overrides are checked this way. A value merged in by `include` replaces the included one as written, so an
+including file can change a value's unit, or turn a range into a number. That is a known limit until designs
+have a schema to check against.
 """
 
 from __future__ import annotations
@@ -324,14 +334,15 @@ def _set(node: Any, part: str, value: Any) -> None:
 
 def _fit(old: Any, new: Any) -> Any:
     """`new`, checked against the value it replaces and converted to that value's unit."""
-    if isinstance(new, Design):
-        raise DesignError("an override sets a value, not an empty table")
     if isinstance(old, Design):
         raise DesignError("this is a table; override its values one by one")
-    if isinstance(old, list):
-        if not isinstance(new, list):
-            raise DesignError("this is a list; override it with a list, or one item by its index")
-        return new
+    if isinstance(new, Design):
+        raise DesignError("an override sets a value, not a table")
+    if isinstance(old, list) or isinstance(new, list):
+        return _fit_list(old, new)
+    if isinstance(old, Uncertain) and not isinstance(new, Uncertain):
+        # A single number here would drop the bounds, and the fact that the value is uncertain at all.
+        raise DesignError("this is a range; override its .ref, or give a whole new {ref, range}")
     old_unit, new_unit = _unit(old), _unit(new)
     if old_unit is None and new_unit is None:
         return new
@@ -345,6 +356,23 @@ def _fit(old: Any, new: Any) -> Any:
     if isinstance(new, Uncertain):
         return Uncertain(new.ref.to(old_unit), new.lo.to(old_unit), new.hi.to(old_unit))
     return new.to(old_unit)
+
+
+def _fit_list(old: Any, new: Any) -> list:
+    """A list for a list of the same length, each item fitted to the item it replaces."""
+    if not isinstance(old, list):
+        raise DesignError("this is a single value; an override cannot make it a list")
+    if not isinstance(new, list):
+        raise DesignError("this is a list; override it with a list, or one item by its index")
+    if len(new) != len(old):
+        raise DesignError(f"this list has {len(old)} items and the override has {len(new)}; it cannot add or drop items")
+    fitted = []
+    for i, (old_item, new_item) in enumerate(zip(old, new)):
+        try:
+            fitted.append(_fit(old_item, new_item))
+        except DesignError as e:
+            raise type(e)(f"item {i}: {e}") from None
+    return fitted
 
 
 def _unit(value: Any) -> pint.Unit | None:

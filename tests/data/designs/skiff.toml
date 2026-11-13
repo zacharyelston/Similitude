@@ -16,6 +16,7 @@ shaft = { ref = "508 mm", range = ["381 mm", "0.635 m"] }
 [layout]
 seats = 2
 operator_cg = [1.9, 0.0, 0.45]
+thwarts = ["1.2 m", "2.9 m"]                  # seat positions, from the bow
 
 [[tanks]]
 name = "main"

@@ -40,7 +40,7 @@ def test_a_design_table_also_reads_by_key():
     assert d["hull"]["depth"] == d.hull.depth
     assert "hull" in d and "keel" not in d
     assert list(d) == ["name", "hull", "motor", "layout", "tanks"]
-    assert len(d.layout) == 2
+    assert len(d.layout) == 3
 
 
 def test_a_missing_value_is_an_attribute_error_that_lists_what_is_there():
@@ -111,6 +111,23 @@ def test_a_list_can_be_overridden_whole_by_a_list_only():
     assert d.layout.operator_cg == [2.0, 0.1, 0.5]
     with pytest.raises(DesignError, match="this is a list"):
         design.load(SKIFF, overrides={"layout.operator_cg": 2.0})
+
+
+@pytest.mark.parametrize("value", [[2.0, 0.1], [2.0, 0.1, 0.5, 0.0], []])
+def test_a_whole_list_override_cannot_add_or_drop_items(value):
+    with pytest.raises(DesignError, match=f"override layout.operator_cg: this list has 3 items and the override has {len(value)}"):
+        design.load(SKIFF, overrides={"layout.operator_cg": value})
+
+
+def test_an_override_cannot_turn_a_single_value_into_a_list():
+    with pytest.raises(DesignError, match="override hull.depth: this is a single value"):
+        design.load(SKIFF, overrides={"hull.depth": [0.6, 0.7]})
+
+
+def test_a_list_of_tables_cannot_be_overridden_whole():
+    tanks = [{"name": "a", "volume": "1 l"}, {"name": "b", "volume": "2 l"}]
+    with pytest.raises(DesignError, match="override tanks: item 0: this is a table"):
+        design.load(SKIFF, overrides={"tanks": tanks})
 
 
 @pytest.mark.parametrize("key", ["layout.operator_cg.3", "layout.operator_cg.-1", "layout.operator_cg.x", "tanks.2.name"])
@@ -216,10 +233,39 @@ def test_an_override_cannot_move_ref_outside_its_range():
         design.load(SKIFF, overrides={"hull.speed.ref": 20.0})
 
 
-def test_an_override_can_replace_a_range_with_a_number_or_another_range():
-    assert design.load(SKIFF, overrides={"hull.speed": 10.0}).hull.speed == 10.0
-    d = design.load(SKIFF, overrides={"hull.speed": {"ref": 10.0, "range": [9.0, 11.0]}})
-    assert d.hull.speed == Uncertain(10.0, 9.0, 11.0)
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("hull.speed", 10.0),  # a range with no unit
+        ("hull.speed", 100.0),
+        ("motor.power", "18 kW"),  # a range with a unit, and a number in a unit that fits
+        ("motor.power", "18000 W"),
+        ("motor.shaft", {"value": 20.0, "unit": "inch"}),
+        ("motor.power", ureg.Quantity(18.0, "kW")),
+    ],
+)
+def test_a_single_number_cannot_override_a_range(key, value):
+    with pytest.raises(DesignError, match=f"override {key}: this is a range"):
+        design.load(SKIFF, overrides={key: value})
+    assert isinstance(design.load(SKIFF).hull.speed, Uncertain)
+
+
+def test_an_override_can_replace_a_range_with_a_whole_new_range():
+    d = design.load(SKIFF, overrides={"hull.speed": {"ref": 100.0, "range": [90.0, 110.0]}})
+    assert d.hull.speed == Uncertain(100.0, 90.0, 110.0)
+    d = design.load(SKIFF, overrides={"motor.power": {"ref": "18000 W", "range": ["12000 W", "24000 W"]}})
+    assert d.motor.power == Uncertain(ureg.Quantity(18.0, "kW"), ureg.Quantity(12.0, "kW"), ureg.Quantity(24.0, "kW"))
+
+
+def test_a_range_of_zero_width_pins_a_value_and_is_still_a_range():
+    d = design.load(SKIFF, overrides={"hull.speed": {"ref": 10.0, "range": [10.0, 10.0]}})
+    assert d.hull.speed == Uncertain(10.0, 10.0, 10.0)
+    assert design.nominal(d).hull.speed == 10.0
+
+
+def test_an_override_can_turn_a_plain_number_into_a_range():
+    d = design.load(SKIFF, overrides={"hull.depth": {"ref": 0.6, "range": [0.5, 0.7]}})
+    assert d.hull.depth == Uncertain(0.6, 0.5, 0.7)
 
 
 # --- units ------------------------------------------------------------------------------------------------------
@@ -272,13 +318,19 @@ def test_an_override_can_be_a_pint_quantity():
         ("hull.length", {"value": 3.0, "unit": "kg"}, "kilogram does not convert"),
         ("hull.length", 5.2, "needs a unit"),  # a bare number where the design has a unit
         ("hull.depth", "0.7 m", "has no unit"),  # a unit where the design has none
-        ("hull.speed", "10 kn", "has no unit"),
+        ("hull.speed", {"ref": "10 kn", "range": ["8 kn", "12 kn"]}, "has no unit"),
         ("hull.speed.ref", "10 kn", "has no unit"),
-        ("motor.power", "20 m", "meter does not convert"),
-        ("motor.power", 20.0, "needs a unit"),
+        ("motor.power.ref", "18 m", "meter does not convert"),
         ("motor.power.ref", 18.0, "needs a unit"),
         ("motor.power", {"ref": 18.0, "range": [12.0, 20.0]}, "needs a unit"),
+        ("motor.power", {"ref": 18.0, "range": [12.0, 20.0], "unit": "m"}, "meter does not convert"),
         ("tanks.0.volume", "40 kg", "kilogram does not convert"),
+        ("layout.thwarts.0", "3 s", "second does not convert"),
+        # a whole list is checked item by item, like the single items above
+        ("layout.thwarts", ["3 s", "4 s"], "item 0: .*second does not convert"),
+        ("layout.thwarts", ["1.3 m", "4 s"], "item 1: .*second does not convert"),
+        ("layout.thwarts", [1.3, 3.0], "item 0: .*needs a unit"),
+        ("layout.operator_cg", ["2 m", "0 m", "0.5 m"], "item 0: .*has no unit"),
     ],
 )
 def test_a_unit_mismatch_on_override_is_an_error(key, value, complaint):
@@ -287,10 +339,29 @@ def test_a_unit_mismatch_on_override_is_an_error(key, value, complaint):
 
 
 def test_an_override_of_a_range_with_a_unit_is_converted_too():
-    d = design.load(SKIFF, overrides={"motor.power.ref": "18000 W", "motor.shaft": "20 inch"})
+    d = design.load(SKIFF, overrides={"motor.power.ref": "18000 W", "motor.shaft.ref": "20 inch"})
     assert d.motor.power == Uncertain(ureg.Quantity(18.0, "kW"), ureg.Quantity(10.0, "kW"), ureg.Quantity(20.0, "kW"))
-    assert str(d.motor.shaft.units) == "millimeter"
-    assert d.motor.shaft.magnitude == pytest.approx(508.0)  # the inch is exactly 25.4 mm
+    assert str(d.motor.shaft.ref.units) == "millimeter"
+    assert d.motor.shaft.ref.magnitude == pytest.approx(508.0)  # the inch is exactly 25.4 mm
+    assert d.motor.shaft.hi == ureg.Quantity(635.0, "mm")  # the bounds are kept
+
+
+def test_a_whole_list_override_in_compatible_units_is_converted_item_by_item():
+    d = design.load(SKIFF, overrides={"layout.thwarts": ["130 cm", "10 ft"]})
+    assert [str(q.units) for q in d.layout.thwarts] == ["meter", "meter"]
+    assert [q.magnitude for q in d.layout.thwarts] == pytest.approx([1.3, 3.048])  # 10 × 0.3048
+
+
+def test_a_whole_list_override_keeps_the_range_rules_for_each_item(tmp_path):
+    path = write(tmp_path, "d.toml", 'stations = [{ ref = "1 m", range = ["0.9 m", "1.1 m"] }, "2 m"]\n')
+    with pytest.raises(DesignError, match="override stations: item 0: this is a range"):
+        design.load(path, overrides={"stations": ["1 m", "2 m"]})
+    d = design.load(path, overrides={"stations": [{"ref": "105 cm", "range": ["95 cm", "115 cm"]}, "210 cm"]})
+    station = d.stations[0]
+    assert isinstance(station, Uncertain)
+    assert [metres(q) for q in (station.ref, station.lo, station.hi)] == pytest.approx([1.05, 0.95, 1.15])
+    assert [str(q.units) for q in (station.ref, station.lo, station.hi, d.stations[1])] == ["meter"] * 4
+    assert d.stations[1].magnitude == pytest.approx(2.1)
 
 
 # --- include ----------------------------------------------------------------------------------------------------
