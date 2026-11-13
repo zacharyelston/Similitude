@@ -1,11 +1,11 @@
-# Working in Froude
+# Working in Similitude
 
 - **Branches and PRs:** after the initial commit, make every change on a branch (`feat/…`, `fix/…`, `chore/…`)
   and merge it through a PR into `main`. Don't stack PRs; target `main`. Never commit credentials, keys or
   personal data.
 - **Public repo:** never commit internal hostnames, logins, company domains or other projects' names. The compute
   hosts are `gpu1` and `gpu2`.
-- **Licensing:** Froude is Apache-2.0.
+- **Licensing:** Similitude is Apache-2.0.
   - Don't import or link GPL or LGPL code. Call those tools (OpenFOAM, Capytaine, XFoil, AVL, CalculiX, Blender) as
     separate programs, through files or subprocesses.
   - Don't add tools that are free only for non-commercial use, or commercial optimizers.

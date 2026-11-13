@@ -3,9 +3,9 @@
 import tomllib
 from pathlib import Path
 
-import froude
+import similitude
 
 
 def test_the_package_version_matches_pyproject():
     meta = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
-    assert froude.__version__ == meta["project"]["version"]
+    assert similitude.__version__ == meta["project"]["version"]
