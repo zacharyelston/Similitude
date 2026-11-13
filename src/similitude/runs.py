@@ -41,6 +41,7 @@ Git is called as a separate program.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import json
@@ -50,11 +51,19 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
+
 RUNS_DIR = "runs"
+LOCK = "similitude-keep.lock"  # in the checkout's git directory, so it never shows in the working tree
 START = "START"
 SOURCE = "SOURCE"
 DESIGN = "design.toml"
@@ -200,7 +209,8 @@ def keep(
     - UndisposedWarningError if `checks.json` holds a WARN with no disposition;
     - ExpectationsChangedError if `expect.toml` was added, edited or removed after the run started.
 
-    A keep that fails leaves `runs/` as it was: no directory and no README row.
+    A keep that fails leaves `runs/` as it was: no directory and no README row. Keeps of one checkout run one at
+    a time, across threads and processes, so each gets its own README row; a second keep waits for the first.
     """
     src = Path(src_dir).resolve()
     if not src.is_dir():
@@ -258,26 +268,29 @@ def keep(
     readme = root / RUNS_DIR / README
     tmp = dest.with_name(f".{run}.tmp")
     readme_tmp = dest.with_name(f".{run}.{README}.tmp")
-    if tmp.exists():
-        shutil.rmtree(tmp)
-    try:
-        shutil.copytree(src, tmp)
-        if design_path != src / DESIGN:
-            shutil.copyfile(design_path, tmp / DESIGN)
-        header = "Where this kept run came from. Written by similitude.runs.keep; never edit a kept run."
-        (tmp / SOURCE).write_text(_toml_text(header, source), encoding="utf-8")
-        (tmp / REPORT).write_text(_report(source, outcomes), encoding="utf-8")
-        readme_tmp.write_text(_readme_with_row(readme, source, outcomes, shows), encoding="utf-8")
-        os.rename(tmp, dest)
+    with _keeping(root):
+        if dest.exists():  # kept by another keep while this one waited
+            raise FileExistsError(f"{RUNS_DIR}/{run} is already kept; a kept run is never overwritten")
+        if tmp.exists():
+            shutil.rmtree(tmp)  # left by a keep that was killed
         try:
-            os.replace(readme_tmp, readme)
+            shutil.copytree(src, tmp)
+            if design_path != src / DESIGN:
+                shutil.copyfile(design_path, tmp / DESIGN)
+            header = "Where this kept run came from. Written by similitude.runs.keep; never edit a kept run."
+            (tmp / SOURCE).write_text(_toml_text(header, source), encoding="utf-8")
+            (tmp / REPORT).write_text(_report(source, outcomes), encoding="utf-8")
+            readme_tmp.write_text(_readme_with_row(readme, source, outcomes, shows), encoding="utf-8")
+            os.rename(tmp, dest)
+            try:
+                os.replace(readme_tmp, readme)
+            except BaseException:
+                os.rename(dest, tmp)  # the run is not kept until its README row is
+                raise
         except BaseException:
-            os.rename(dest, tmp)  # the run is not kept until its README row is
+            shutil.rmtree(tmp, ignore_errors=True)
+            readme_tmp.unlink(missing_ok=True)
             raise
-    except BaseException:
-        shutil.rmtree(tmp, ignore_errors=True)
-        readme_tmp.unlink(missing_ok=True)
-        raise
     return dest
 
 
@@ -315,6 +328,36 @@ def _git(cwd: Path, *args: str, check: bool = True) -> str:
     if check and done.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed in {cwd}: {done.stderr.strip()}")
     return done.stdout.rstrip("\n")
+
+
+@contextlib.contextmanager
+def _keeping(root: Path):
+    """Hold the checkout's keep lock: one keep at a time, across threads and processes.
+
+    Reading `runs/README.md`, publishing the run directory and replacing the README must not interleave with
+    another keep, or one of two rows is lost. The lock is on a file in the checkout's git directory, and the
+    operating system drops it if the process dies.
+    """
+    path = Path(_git(root, "rev-parse", "--absolute-git-dir")) / LOCK
+    with open(path, "a+b") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        else:
+            handle.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            else:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def _root(repo: str | os.PathLike | None) -> Path:

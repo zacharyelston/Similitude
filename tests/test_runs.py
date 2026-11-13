@@ -7,6 +7,8 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
+import time
 import tomllib
 from pathlib import Path
 
@@ -451,6 +453,73 @@ def test_a_keep_that_cant_read_the_readme_keeps_nothing(repo, out):
     assert kept_names(repo) == ["README.md"]
     (repo / "runs" / "README.md").rmdir()
     assert keep(out, repo).is_dir()
+
+
+def test_two_keeps_at_once_both_get_their_readme_row(repo, monkeypatch):
+    first, second = begin(repo, "first"), begin(repo, "second")
+    both_have_read = threading.Barrier(2)
+    read_readme = runs._readme_with_row
+
+    def read_then_wait_for_the_other(*args):
+        text = read_readme(*args)
+        try:
+            both_have_read.wait(timeout=1)  # unserialized, both keeps get here holding the same README text
+        except threading.BrokenBarrierError:
+            pass  # serialized, the other keep hasn't read yet
+        return text
+
+    monkeypatch.setattr(runs, "_readme_with_row", read_then_wait_for_the_other)
+    failures = []
+
+    def keep_it(out, name):
+        try:
+            keep(out, repo, name=name)
+        except BaseException as err:
+            failures.append(err)
+
+    threads = [threading.Thread(target=keep_it, args=(d, d.name)) for d in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert failures == []
+    assert kept_names(repo) == ["2026-11-13_first", "2026-11-13_second", "README.md"]
+    rows = [line for line in (repo / "runs" / "README.md").read_text().splitlines() if line.startswith("| [")]
+    assert sorted(row.split("]")[0] for row in rows) == ["| [2026-11-13_first", "| [2026-11-13_second"]
+
+
+def test_a_keep_waits_for_a_keep_in_another_process(repo, out):
+    script = (
+        "import datetime, sys; from similitude import runs; "
+        "runs.keep(sys.argv[1], 'sweep', repo=sys.argv[2], date=datetime.date(2026, 11, 13))"
+    )
+    with runs._keeping(repo):  # as if a keep were under way in this process
+        other = subprocess.Popen([sys.executable, "-c", script, str(out), str(repo)], stderr=subprocess.PIPE)
+        time.sleep(1.0)
+        waiting = other.poll() is None and not (repo / "runs").exists()
+    assert other.wait(timeout=30) == 0, other.stderr.read().decode()
+    assert waiting
+    assert kept_names(repo) == [RUN, "README.md"]
+
+
+def test_two_keeps_of_one_name_at_once_keep_one_run(repo):
+    first, second = begin(repo, "first"), begin(repo, "second")
+    outcomes = []
+
+    def keep_it(out):
+        try:
+            outcomes.append(keep(out, repo, name="same"))
+        except FileExistsError as err:
+            outcomes.append(err)
+
+    threads = [threading.Thread(target=keep_it, args=(d,)) for d in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert sorted(isinstance(o, FileExistsError) for o in outcomes) == [False, True]
+    assert kept_names(repo) == ["2026-11-13_same", "README.md"]
+    assert len([x for x in (repo / "runs" / "README.md").read_text().splitlines() if x.startswith("| [")]) == 1
 
 
 # --- a dirty working tree
