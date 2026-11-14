@@ -45,8 +45,12 @@ quote it twice: `--set 'label="3"'`.
   evaluated, the one check written is a FAIL that says so, and `design.toml` is the best-ranked candidate as it
   was tried, which may not load.
 
-Because the run holds its own design, `keep` takes no `--design` for it, and refuses one. A trial's best
-candidate with a WARN is kept only once `checks.json` records its disposition.
+Because the run holds its own design, `keep` takes no `--design` for it, and refuses one.
+
+**A WARN** does not fail a check or a trial, but `keep` refuses a run that has one with no disposition: a line
+saying why it is acceptable. The model gives it, by returning that check as `check.disposed("why")`. The reason
+then lives in the project's code and is recorded when the run is made. No command adds one afterwards: change
+the model, run again, and keep that run.
 
 - A directory that already has a `START`, a `checks.json` or a `design.toml` is refused: remove it, or name
   another.
@@ -81,6 +85,12 @@ CHECKS_MD = "checks.md"
 _REGISTER = (
     f'no model is registered; a project names one in its pyproject.toml under [project.entry-points."{GROUP}"], '
     'as `name = "package.module:evaluate"`, and must be installed'
+)
+
+
+_UNDISPOSED = (
+    "the run has a WARN with no disposition: {checks}. The model disposes a WARN: have it return that check as "
+    'check.disposed("why"), so the reason is in the project\'s code, then run again and keep that run'
 )
 
 
@@ -162,7 +172,10 @@ def _parser() -> argparse.ArgumentParser:
     check = commands.add_parser(
         "check",
         help="load a design, run the model's checks on it, and exit 1 if any is a FAIL",
-        description="Load a design, run the project's model on it and print its checks. Exits 1 if any is a FAIL.",
+        description=(
+            "Load a design, run the project's model on it and print its checks. Exits 1 if any is a FAIL. A WARN "
+            'does not fail the check, but a run is kept only if the model disposed it: check.disposed("why").'
+        ),
     )
     check.add_argument("design", help="the design file (TOML)")
     check.add_argument(
@@ -199,7 +212,10 @@ def _parser() -> argparse.ArgumentParser:
     keep = commands.add_parser(
         "keep",
         help="copy an output directory to runs/<date>_<name>/ with where it came from",
-        description="Keep a run: copy its output directory to runs/<date>_<name>/ and record its source.",
+        description=(
+            "Keep a run: copy its output directory to runs/<date>_<name>/ and record its source. A run with a WARN "
+            'is kept only if the model disposed it, by returning that check as check.disposed("why").'
+        ),
     )
     keep.add_argument("dir", help="the run's output directory")
     keep.add_argument("name", help="the kept run's name: letters, digits, '.', '_' and '-'")
@@ -401,6 +417,8 @@ def _keep(args: argparse.Namespace) -> int:
         kept = runs.keep(
             src, args.name, design=args.design, command=command, shows=args.shows, allow_dirty=args.allow_dirty
         )
+    except runs.UndisposedWarningError as e:
+        raise CliError(_UNDISPOSED.format(checks=str(e).rpartition("before keeping: ")[2])) from e
     except (ValueError, RuntimeError, OSError) as e:
         raise CliError(_as_flags(str(e))) from e
     print(os.path.relpath(kept))

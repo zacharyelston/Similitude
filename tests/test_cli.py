@@ -56,6 +56,13 @@ def returns_a_list(d):
 
 def no_checks(d):
     return Evaluation({"volume_cm3": 1.0})
+
+
+def disposes(d):
+    """The same can, from a project that has decided a thin wall is acceptable and says why."""
+    result = evaluate(d)
+    why = "the cans ship in trays, so nothing presses on the wall"
+    return Evaluation(result.metrics, [c.disposed(why) if c.status == "WARN" else c for c in result.checks])
 '''
 
 TRIAL = """\
@@ -649,26 +656,66 @@ def test_a_trial_writes_its_winners_checks_and_design(can, repo, capsys):
     assert reproduces(run_dir)
 
 
-def test_a_trial_whose_winner_has_a_warn_is_kept_only_once_the_warn_is_disposed(can, repo, capsys):
-    thin = (repo / "can.toml").read_text(encoding="utf-8").replace('wall = "0.30 mm"', 'wall = "0.21 mm"')
-    (repo / "can.toml").write_text(thin, encoding="utf-8")
-    trial = trial_file(repo)
+WHY = "the cans ship in trays, so nothing presses on the wall"
+HOW = 'The model disposes a WARN: have it return that check as check.disposed("why")'
+
+
+@pytest.fixture
+def thin(register, repo):
+    """A can with a 0.21 mm wall, which is a WARN, and two models: `can` leaves the WARN, `careful` disposes it."""
+    register(can="toy_can:evaluate", careful="toy_can:disposes")
+    text = (repo / "can.toml").read_text(encoding="utf-8").replace('wall = "0.30 mm"', 'wall = "0.21 mm"')
+    (repo / "can.toml").write_text(text, encoding="utf-8")
+    trial_file(repo)
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "a thin can and a trial")
-    assert run("trial", trial, "--workers", 1, "--out", "out/warn") == 0  # a WARN does not fail a trial
+    return repo
+
+
+def kept_with_its_disposition(run_dir):
+    (wall,) = [c for c in checks.from_json((run_dir / "checks.json").read_text(encoding="utf-8")) if c.name == "wall"]
+    row = f"| WARN | Can | wall | 0.21 mm | >= 0.22, fail < 0.2 |  | {WHY} |"
+    return (wall.status, wall.disposition) == ("WARN", WHY) and row in (run_dir / "checks.md").read_text("utf-8")
+
+
+def test_a_checked_run_with_a_warn_is_kept_only_if_the_model_disposed_it(thin, capsys):
+    assert run("check", "can.toml", "--model", "can", "--out", "out/left") == 0  # a WARN does not fail a check
+    assert "| WARN | Can | wall | 0.21 mm | >= 0.22, fail < 0.2 |  | *none recorded* |" in capsys.readouterr().out
+    assert run("keep", "out/left", "left") == 2
+    err = capsys.readouterr().err
+    assert "the run has a WARN with no disposition: Can: wall. " + HOW in err
+    assert "checks.json" not in err  # nothing sends anyone to edit the results by hand
+    assert not (thin / "runs").exists()
+
+    assert run("check", "can.toml", "--model", "careful", "--out", "out/disposed") == 0
+    assert f"| {WHY} |" in capsys.readouterr().out
+    assert run("keep", "out/disposed", "disposed") == 0
+    assert kept_with_its_disposition(kept(thin, "disposed"))
+
+
+def test_a_trial_whose_winner_has_a_warn_is_kept_only_if_the_model_disposed_it(thin, capsys):
+    assert run("trial", "lighter-can.toml", "--model", "can", "--workers", 1, "--out", "out/left") == 0
+    assert "0 FAIL, 1 WARN" in capsys.readouterr().out  # a WARN does not fail a trial
+    found = checks.from_json((thin / "out" / "left" / "checks.json").read_text(encoding="utf-8"))
+    assert [(c.status, c.disposition) for c in found] == [("WARN", ""), ("INFO", ""), ("PASS", "")]
+    assert run("keep", "out/left", "left") == 2
+    assert "the run has a WARN with no disposition: Can: wall. " + HOW in capsys.readouterr().err
+    assert not (thin / "runs").exists()
+
+    assert run("trial", "lighter-can.toml", "--model", "careful", "--workers", 1, "--out", "out/disposed") == 0
     assert "0 FAIL, 1 WARN" in capsys.readouterr().out
-    results = repo / "out" / "warn" / "checks.json"
-    found = checks.from_json(results.read_text(encoding="utf-8"))
-    assert [c.status for c in found] == ["WARN", "INFO", "PASS"]
+    assert run("keep", "out/disposed", "disposed") == 0
+    assert kept_with_its_disposition(kept(thin, "disposed"))
 
-    assert run("keep", "out/warn", "warned") == 2
-    assert "record a disposition in checks.json for each WARN before keeping: Can: wall" in capsys.readouterr().err
-    assert not (repo / "runs").exists()
 
-    found[0] = found[0].disposed("the cans ship in trays, so nothing presses on the wall")
-    results.write_text(checks.to_json(found), encoding="utf-8")
-    assert run("keep", "out/warn", "warned") == 0
-    assert "the cans ship in trays" in (kept(repo, "warned") / "checks.json").read_text(encoding="utf-8")
+def test_the_help_says_how_a_warn_is_disposed(capsys):
+    for command in ("check", "keep"):
+        with pytest.raises(SystemExit):
+            cli.main([command, "--help"])
+        assert 'check.disposed("why")' in " ".join(capsys.readouterr().out.split())
+    assert 'check.disposed("why")' in cli.__doc__
+    with pytest.raises(SystemExit):
+        cli.main(["dispose", "out/can", "wall", "fine"])  # there is no command that adds one after a run
 
 
 def test_a_trials_exit_code_is_that_of_the_checks_it_writes(can, work, capsys):
