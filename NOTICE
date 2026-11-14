@@ -12,6 +12,7 @@ eOx (https://github.com/zacharyelston/eOx), software under the MIT License.
 Ported from it:
 
   src/similitude/checks.py    from src/eox/checks.py
+  src/similitude/figures.py   the palette, from THEMES and STATUS in src/eox/drawings.py
 
 MIT License
 
