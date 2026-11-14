@@ -178,6 +178,7 @@ These are the licenses as I remember them. Confirm each one before adopting the 
 
 | Tool | What it's for | License (to confirm) |
 |---|---|---|
+| Git | The commit, branch and working-tree state recorded with a kept run; called as a separate program | GPL-2.0 (confirmed) |
 | OpenMDAO, OpenAeroStruct | Coupling, optimization with gradients, wing structure | Apache-2.0 |
 | MuJoCo | Rigid-body dynamics | Apache-2.0 |
 | build123d / CadQuery, Gmsh | Parametric CAD, meshing | Apache-2.0; GPL with exceptions |
