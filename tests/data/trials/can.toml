@@ -1,0 +1,12 @@
+# A tin can that must hold a litre, for tests/test_trials.py. The numbers are made up.
+
+name = "can"
+
+[body]
+radius = "50 mm"
+height = "140 mm"
+wall = "0.30 mm"
+
+[steel]
+density = "7.85 g/cm^3"
+min_wall = "0.20 mm"      # thinner walls dent in handling

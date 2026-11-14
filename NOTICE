@@ -11,7 +11,8 @@ eOx (https://github.com/zacharyelston/eOx), software under the MIT License.
 
 Ported from it:
 
-  src/similitude/checks.py    from src/eox/checks.py
+  src/similitude/checks.py           from src/eox/checks.py
+  src/similitude/trials/engine.py    from src/eox/evolve/engine.py
 
 MIT License
 
