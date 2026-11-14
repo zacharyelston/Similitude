@@ -17,6 +17,7 @@ import pytest
 from similitude import design, trials
 from similitude.checks import Check
 from similitude.trials import Constraint, Evaluation, Gene, Objective, Trial, TrialError
+from similitude.trials import engine
 from similitude.trials.engine import _Rng
 
 DATA = Path(__file__).parent / "data" / "trials"
@@ -49,6 +50,18 @@ def can_by_radius(d):
     return Evaluation({"radius_mm": d.body.radius.to("mm").magnitude})
 
 
+def off_five(d):
+    return Evaluation({"off": abs(d.x - 5)})
+
+
+def off_a_fifth(d):
+    return Evaluation({"off": abs(d.y - 0.2)})
+
+
+def solver_that_fails(d):
+    raise ValueError("solver failed\nresidual did not converge \x1b[31mat step 3\x1b[0m\r\n\nsee the log")
+
+
 def can_that_cannot_be_tall(d):
     if d.body.height.to("mm").magnitude > 120:
         raise ValueError("too tall for the press")
@@ -77,6 +90,7 @@ def can_with_nan(d):
 @pytest.fixture
 def here(tmp_path):
     """A project folder: the trial and its design in `trials/`, with results to go in `out/`."""
+    (tmp_path / "pyproject.toml").write_text("")  # what makes it a project
     shutil.copytree(DATA, tmp_path / "trials")
     return tmp_path
 
@@ -209,6 +223,18 @@ def test_a_step_that_does_not_divide_the_range_never_passes_max():
     assert {gene.sample(rng) for _ in range(200)} == {0, 4, 8}
 
 
+def test_a_gene_contains_only_values_in_range_and_on_a_step():
+    whole = Gene("x", 0, 10, 4)
+    assert [v for v in range(-1, 12) if whole.contains(v)] == [0, 4, 8]  # 10 is in range, but past the last step
+    fine = Gene("y", 0.1, 0.9, 0.05)
+    assert fine.contains(0.15) and fine.contains(0.1) and fine.contains(0.9)
+    assert fine.contains(0.1 + 4 * 0.05)  # 0.30000000000000004: float noise is not a step off
+    assert not fine.contains(0.12) and not fine.contains(0.95) and not fine.contains(0.05)
+    free = Gene("z", -1.0, 1.0)
+    assert free.contains(0.123456) and not free.contains(1.5)
+    assert not whole.contains("4") and not whole.contains(True) and not whole.contains(None)
+
+
 def test_a_choice_gene_picks_from_its_choices_and_mutates_to_another():
     rng = _Rng(0)
     gene = Gene("x", choices=["a", "b", "c"])
@@ -332,6 +358,35 @@ def test_the_design_as_it_stands_is_read_in_the_genes_unit(tmp_path):
     assert result.reference["overrides"] == {"body.radius": "50 mm"}
 
 
+def test_a_design_off_a_whole_number_step_is_compared_but_not_bred(tmp_path):
+    (tmp_path / "d.toml").write_text("x = 5\n")
+    t = Trial("grid", tmp_path / "d.toml", [Gene("x", 0, 10, 4)], [Objective("off", "min")], population=4, generations=3)
+    result = trials.run(t, off_five, workers=1, out=tmp_path / "out")
+    assert result.reference["genes"] == {"x": 5} and result.reference["overrides"] == {}
+    assert result.reference["score"] == 0  # the design as it stands would have won
+    assert {r["genes"]["x"] for r in result.individuals} <= {0, 4, 8}
+    assert result.best["genes"] == {"x": 4}  # the nearest value the search may use
+
+
+def test_a_design_off_a_fractional_step_is_compared_but_not_bred(tmp_path):
+    (tmp_path / "d.toml").write_text("y = 0.21\n")
+    t = Trial("grid", tmp_path / "d.toml", [Gene("y", 0.1, 0.9, 0.05)], [Objective("off", "min")], population=4,
+              generations=3)  # fmt: skip
+    result = trials.run(t, off_a_fifth, workers=1, out=tmp_path / "out")
+    assert result.reference["genes"] == {"y": 0.21} and result.reference["overrides"] == {}
+    assert all(Gene("y", 0.1, 0.9, 0.05).contains(r["genes"]["y"]) for r in result.individuals)
+    assert 0.21 not in {r["genes"]["y"] for r in result.individuals}
+
+
+def test_a_design_on_a_fractional_step_starts_the_population(tmp_path):
+    (tmp_path / "d.toml").write_text("y = 0.30000000000000004\n")  # 0.1 + 4 × 0.05, as a float sum gives it
+    t = Trial("grid", tmp_path / "d.toml", [Gene("y", 0.1, 0.9, 0.05)], [Objective("off", "min")], population=4,
+              generations=2)  # fmt: skip
+    result = trials.run(t, off_a_fifth, workers=1, out=tmp_path / "out")
+    assert result.reference["genes"] == {"y": 0.3} and result.reference["overrides"] == {"y": 0.3}
+    assert {"y": 0.3} in [r["genes"] for r in result.individuals if r["generation"] == 0]
+
+
 def test_a_design_outside_the_genes_is_compared_but_not_bred(small, here):
     wide = dataclasses.replace(small, genes=[Gene("body.radius", 60, 80, 1, unit="mm"), *small.genes[1:]])
     result = trials.run(wide, can, workers=1, out=here / "out")
@@ -417,14 +472,53 @@ def test_the_best_design_is_written_as_toml_with_its_overrides(small, here):
     assert "a trial is evidence, not a decision" in text
 
 
-def test_the_best_design_does_not_spell_out_a_far_away_path(small, tmp_path_factory):
-    """`here` is a temporary folder and the design below is in the repository: all they share is the disk's root."""
-    far = dataclasses.replace(small, design=DATA / "can.toml")
-    result = trials.run(far, can, workers=1, out=tmp_path_factory.mktemp("elsewhere"))
+def project(folder, marker="pyproject.toml"):
+    """A project at `folder`, holding the can's design. Returns the design's path."""
+    (folder / "designs").mkdir(parents=True)
+    (folder / marker).mkdir() if marker == ".git" else (folder / marker).write_text("")
+    shutil.copy(DATA / "can.toml", folder / "designs" / "can.toml")
+    return folder / "designs" / "can.toml"
+
+
+@pytest.mark.parametrize("marker", ["pyproject.toml", ".git"])
+def test_a_path_to_the_design_is_given_only_inside_the_designs_own_project(tmp_path, marker):
+    """Everything here is built under one temporary folder, so it does not matter where that folder, or this
+    checkout, is on the machine."""
+    home = tmp_path / "home"
+    can_toml = project(home / "example-person" / "boats", marker)
+    inside = home / "example-person" / "boats" / "out" / "trials" / "lighter-can"
+    assert engine._relative(can_toml, inside) == "../../../designs/can.toml"
+    assert engine._relative(can_toml, home / "example-person" / "boats") == "designs/can.toml"
+    # unrelated trees that share a user's or a system folder: no path between them
+    assert engine._relative(can_toml, home / "shared-results" / "trial") == ""
+    assert engine._relative(can_toml, home / "example-person" / "notes") == ""
+    assert engine._relative(can_toml, home) == ""
+    # another project is not this one either
+    project(home / "example-person" / "planes")
+    assert engine._relative(can_toml, home / "example-person" / "planes" / "out") == ""
+
+
+def test_a_design_in_no_project_is_never_given_a_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "_PROJECT_MARKERS", (".no-folder-has-this",))  # whatever lies above tmp_path
+    (tmp_path / "out").mkdir()
+    (tmp_path / "can.toml").write_text("")
+    assert engine._project(tmp_path / "can.toml") is None
+    assert engine._relative(tmp_path / "can.toml", tmp_path / "out") == ""
+
+
+def test_the_best_design_written_outside_the_project_holds_overrides_alone(small, tmp_path):
+    can_toml = project(tmp_path / "home" / "example-person" / "boats")
+    far = dataclasses.replace(small, design=can_toml)
+    result = trials.run(far, can, workers=1, out=tmp_path / "home" / "shared-results" / "lighter-can")
     text = result.best_toml.read_text()
     written = tomllib.loads(text)
     assert "include" not in written and written["overrides"] == result.best["overrides"]
-    assert str(DATA.parent) not in text and "can.toml" in text
+    assert "can.toml" in text  # it names the design
+    assert "example-person" not in text and "boats" not in text and str(tmp_path) not in text  # but not where it is
+    # written inside the project, the same run includes the design, by a path that stays inside it
+    near = trials.run(far, can, workers=1, out=can_toml.parent.parent / "out" / "trials" / "lighter-can")
+    assert tomllib.loads(near.best_toml.read_text())["include"] == "../../../designs/can.toml"
+    assert design.load(near.best_toml) == design.load(can_toml, overrides=near.best["overrides"])
 
 
 def test_results_go_to_out_trials_by_default(small, here, monkeypatch):
@@ -465,6 +559,29 @@ def test_when_no_candidate_can_be_evaluated_the_best_design_overrides_nothing(sm
     text = result.best_toml.read_text()
     assert "No candidate could be evaluated" in text and "overrides" not in tomllib.loads(text)
     assert design.load(result.best_toml) == design.load(short.design)
+
+
+def test_an_error_of_several_lines_still_leaves_a_best_design_that_loads(small, here):
+    result = trials.run(small, solver_that_fails, workers=1, out=here / "out")
+    text = result.best_toml.read_text()
+    assert tomllib.loads(text) == {"include": "../trials/can.toml"}  # valid TOML, with nothing overridden
+    assert design.load(result.best_toml) == design.load(small.design)
+    assert "# ValueError: solver failed\n# residual did not converge \\x1b[31mat step 3\\x1b[0m\n#\n# see the log\n" in text
+    assert "\x1b" not in text and "\r" not in text
+    assert lines(result.history)[1]["error"].startswith("ValueError: solver failed\nresidual")  # kept whole there
+
+
+def test_free_text_in_the_best_design_stays_inside_its_comments(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("")
+    (tmp_path / "d.toml").write_text('finish = "plain"\n')
+    finishes = Gene("finish", choices=["plain", "two\nlines # and a hash"])
+    t = Trial("a name\nover two lines", tmp_path / "d.toml", [finishes], [Objective("off", "min")], population=4,
+              generations=2)  # fmt: skip
+    result = trials.run(t, lambda d: Evaluation({"off": float(d.finish == "plain")}), workers=1, out=tmp_path / "out")
+    written = tomllib.loads(result.best_toml.read_text())
+    assert written == {"include": "../d.toml", "overrides": {"finish": "two\nlines # and a hash"}}
+    assert "# Trial a name over two lines:" in result.best_toml.read_text()
+    assert '# the design has "plain"' in result.best_toml.read_text()
 
 
 def test_a_metric_that_is_not_finite_makes_the_candidate_an_error(small, here):

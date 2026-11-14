@@ -41,6 +41,8 @@ and writes two files:
 - `history.jsonl`: the design as it stands, then every candidate of every generation, best first, with its genes,
   the overrides it was loaded with, its metrics and every check;
 - `best.toml`: the best candidate as a design file, which includes the trial's design and sets `[overrides]`.
+  The include is a relative path, and is only written inside the design's own project (the nearest folder above
+  it with a `.git` or a `pyproject.toml`); anywhere else the file holds the `[overrides]` alone.
 
 How candidates are ranked, best first:
 
@@ -156,9 +158,15 @@ class Gene:
         return self._snap(rng.uniform(self.lo, self.hi))
 
     def contains(self, value: Any) -> bool:
+        """Whether the search could produce this value: one of the choices, or in range and on a step."""
         if self.choices is not None:
             return any(_same(c, value) for c in self.choices)
-        return _is_number(value) and self.lo - 1e-9 <= value <= self.hi + 1e-9
+        if not (_is_number(value) and self.lo - 1e-9 <= value <= self.hi + 1e-9):
+            return False
+        if not self.step:
+            return True
+        steps = (value - self.lo) / self.step
+        return abs(steps - round(steps)) <= 1e-9 and round(steps) <= self._last_step()
 
     def mutate(self, value: Any, rng: _Rng, sigma: float) -> Any:
         """A nearby value: another choice, or a step drawn from a normal `sigma` of the range wide."""
@@ -175,12 +183,15 @@ class Gene:
         """The values that must fit the design for every value to fit: both ends, or every choice."""
         return self.choices if self.choices is not None else (self._snap(self.lo), self._snap(self.hi))
 
+    def _last_step(self) -> int:
+        """How many steps from min the last value at or below max is."""
+        return math.floor((self.hi - self.lo) / self.step + 1e-9)
+
     def _snap(self, x: float) -> float | int:
         x = min(max(x, self.lo), self.hi)
         if not self.step:
             return float(x)
-        steps = min(round((x - self.lo) / self.step), math.floor((self.hi - self.lo) / self.step + 1e-9))
-        x = self.lo + steps * self.step
+        x = self.lo + min(round((x - self.lo) / self.step), self._last_step()) * self.step
         return x if self.whole else float(f"{x:.12g}")  # 12 digits: drops the float noise of lo + n * step
 
 
@@ -488,8 +499,8 @@ def run(
                 f.write(json.dumps(rec, allow_nan=False) + "\n")
                 f.flush()
 
-            # The design as it stands starts the population when it lies inside the genes' ranges. A trial that
-            # looks elsewhere still scores it, for comparison.
+            # The design as it stands starts the population when every gene could produce its value: in range,
+            # and on a step. A trial that looks elsewhere still scores it, for comparison.
             in_range = all(g.contains(baseline[g.key]) for g in trial.genes)
             log("reference: the design as it stands" + ("" if in_range else " (outside the genes: compared, not bred)"))
             evaluate_all([(baseline, overrides(baseline) if in_range else {})])
@@ -562,10 +573,10 @@ def _fit_to_design(trial: Trial) -> dict:
             current = float(f"{current.to(g.unit).magnitude:.12g}") if g.unit else None
         if not _is_number(current):
             baseline[g.key] = None
-        elif g.whole and current == round(current):
-            baseline[g.key] = round(current)  # a whole number, like the gene's own values
+        elif g.contains(current):
+            baseline[g.key] = g._snap(current)  # exactly one of the gene's own values
         else:
-            baseline[g.key] = float(current)
+            baseline[g.key] = current  # out of range or off a step: `run` compares it, and does not breed it
     return baseline
 
 
@@ -593,20 +604,22 @@ def _at(tree: Any, dotted: str) -> Any:
 def best_toml(trial: Trial, best: dict, reference: dict, out_dir: Path) -> str:
     """The best candidate as a design file: the trial's design, included, plus the genes as `[overrides]`.
 
-    The design is included by a relative path, so the file can be loaded as it is. When the two share no
-    directory, there is no such path that would not spell out where the design lives on this machine, so the
-    file then holds the `[overrides]` alone, and says which design they are for."""
+    The design is included by a relative path when this file is written inside the design's own project, so
+    the file can be loaded as it is and the path never leaves the project. Written anywhere else, a path to the
+    design would spell out where it lives on this machine, so the file then holds the `[overrides]` alone, and
+    says which design they are for."""
     include = _relative(trial.design, out_dir)
-    lines = [f"# Trial {trial.name}: the best candidate, as [overrides] of {trial.design.name}."]
+    name, design_name = _one_line(trial.name), _one_line(trial.design.name)
+    lines = [f"# Trial {name}: the best candidate, as [overrides] of {design_name}."]
     if include:
         lines.append("# Load it with similitude.design.load: it includes that design.")
     else:
-        lines.append(f"# It does not include {trial.design.name}, which is not near this file: load that design")
-        lines.append("# with these overrides, or copy them into a design file that includes it.")
+        lines.append(f"# It does not include {design_name}, which is not in a project this file is in: load that")
+        lines.append("# design with these overrides, or copy them into a design file that includes it.")
     lines.append("# Review before adopting: a trial is evidence, not a decision.")
     include = [f"include = {json.dumps(include)}", ""] if include else []
     if "error" in best:
-        lines += ["# No candidate could be evaluated, so nothing is overridden.", f"# {best['error']}", ""]
+        lines += ["# No candidate could be evaluated, so nothing is overridden.", *_comment(best["error"]), ""]
         return "\n".join(lines + include).rstrip() + "\n"
     was = "it could not be evaluated" if "error" in reference else f"{reference['score']:.6g}"
     lines.append(f"# Score {best['score']:.6g} (the design as it stands: {was}; lower is better).")
@@ -619,21 +632,48 @@ def best_toml(trial: Trial, best: dict, reference: dict, out_dir: Path) -> str:
     width = max(len(row) for row in rows)
     for row, key in zip(rows, best["genes"]):
         was = reference["genes"][key]
-        note = "" if was == best["genes"][key] else f"  # the design has {'another value' if was is None else was}"
+        was = "another value" if was is None else _toml(was)  # a string is quoted, so it stays on one line
+        note = "" if reference["genes"][key] == best["genes"][key] else f"  # the design has {was}"
         lines.append(f"{row:<{width}}{note}".rstrip())
     return "\n".join(lines) + "\n"
 
 
+_PROJECT_MARKERS = (".git", "pyproject.toml")
+
+
+def _project(path: Path) -> Path | None:
+    """The project a file belongs to: its nearest folder, going up, that holds a `.git` or a `pyproject.toml`."""
+    for folder in path.resolve().parents:
+        if any((folder / marker).exists() for marker in _PROJECT_MARKERS):
+            return folder
+    return None
+
+
 def _relative(target: Path, start: Path) -> str:
-    """The path to `target` from the directory `start`, or "" when all they share is the root of the disk."""
+    """The path to the file `target` from the folder `start`, when `start` is inside `target`'s project.
+
+    Otherwise "": two folders that merely share an ancestor, such as a home or a temporary directory, are not
+    one project, and a path between them would name folders that say whose machine this is."""
     target, start = target.resolve(), start.resolve()
-    try:
-        shared = Path(os.path.commonpath([target, start]))
-    except ValueError:  # on different Windows drives
-        return ""
-    if shared == Path(shared.anchor):
+    project = _project(target)
+    if project is None or not start.is_relative_to(project):
         return ""
     return Path(os.path.relpath(target, start)).as_posix()
+
+
+def _one_line(text: str) -> str:
+    """Free text made safe for one comment line."""
+    return _printable(" ".join(str(text).split()))
+
+
+def _comment(text: str) -> list[str]:
+    """Free text as TOML comment lines, however many lines it has."""
+    return [f"# {_printable(line)}".rstrip() for line in str(text).splitlines()] or ["#"]
+
+
+def _printable(line: str) -> str:
+    """A line with its control characters, which TOML does not allow in a comment, written out as \\x1b."""
+    return "".join(c if c == "\t" or (c >= " " and c != "\x7f") else f"\\x{ord(c):02x}" for c in line)
 
 
 def _toml(value: Any) -> str:
