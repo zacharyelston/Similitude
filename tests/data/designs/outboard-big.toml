@@ -1,0 +1,4 @@
+# A bigger motor, to include after a boat.
+
+[motor]
+power = { ref = 30.0, range = [25.0, 35.0], unit = "kW" }

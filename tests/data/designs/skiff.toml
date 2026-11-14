@@ -1,0 +1,27 @@
+# A small open boat with an outboard. The numbers are made up: this file exists for tests/test_design.py.
+
+name = "skiff"
+
+[hull]
+length = "4.57 m"
+beam = { value = 1.8, unit = "m" }
+depth = 0.6                                   # a plain number: no unit
+skin = "5 mm plywood"                         # text, not a quantity
+speed = { ref = 9.0, range = [7.0, 12.0] }    # knots, written without a unit
+
+[motor]
+power = { ref = 15.0, range = [10.0, 20.0], unit = "kW" }
+shaft = { ref = "508 mm", range = ["381 mm", "0.635 m"] }
+
+[layout]
+seats = 2
+operator_cg = [1.9, 0.0, 0.45]
+thwarts = ["1.2 m", "2.9 m"]                  # seat positions, from the bow
+
+[[tanks]]
+name = "main"
+volume = "40 l"
+
+[[tanks]]
+name = "reserve"
+volume = "12 l"

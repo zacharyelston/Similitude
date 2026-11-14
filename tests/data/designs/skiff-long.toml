@@ -1,0 +1,15 @@
+# The skiff, stretched: the including file wins over what it includes.
+
+include = "skiff.toml"
+
+name = "skiff-long"
+
+[hull]
+length = "5.2 m"
+
+[canopy]
+height = "1.1 m"
+
+[overrides]
+"layout.seats" = 3
+"layout.operator_cg.0" = 2.2
