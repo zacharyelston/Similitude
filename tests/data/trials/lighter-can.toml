@@ -1,0 +1,41 @@
+# How light can the can be? The answer is known: for a fixed volume, a closed cylinder has the least surface
+# when its height equals its diameter. tests/test_trials.py checks the search against that.
+
+[trial]
+name = "lighter-can"
+design = "can.toml"
+question = "How light can the can be and still hold a litre?"
+population = 24
+generations = 40
+elite = 2
+seed = 1
+
+[[trial.gene]]
+key = "body.radius"
+min = 30
+max = 80
+step = 1
+unit = "mm"
+why = "the can's proportions: squat or tall"
+
+[[trial.gene]]
+key = "body.height"
+min = 50
+max = 200
+step = 1
+unit = "mm"
+why = "the can's proportions: squat or tall"
+
+[[trial.gene]]
+key = "body.wall"
+choices = [0.15, 0.2, 0.25, 0.3]
+unit = "mm"
+why = "sheet gauges on offer; the thinnest is lightest, but it fails the denting check"
+
+[[trial.objective]]
+metric = "mass_g"
+goal = "min"
+
+[[trial.constraint]]
+metric = "volume_cm3"
+min = 1000
