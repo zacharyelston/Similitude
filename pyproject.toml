@@ -13,6 +13,9 @@ dependencies = [
     "pint>=0.26.2",
 ]
 
+[project.scripts]
+similitude = "similitude.cli:main"
+
 [dependency-groups]
 dev = ["pytest>=8"]
 
