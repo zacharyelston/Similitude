@@ -18,6 +18,9 @@ figures = [
     "matplotlib>=3.9",
 ]
 
+[project.scripts]
+similitude = "similitude.cli:main"
+
 [dependency-groups]
 dev = [
     "matplotlib>=3.9",
